@@ -16,7 +16,7 @@ use std::{fs, path};
 mod util;
 mod header;
 
-fn main() {
+fn main() -> std::result::Result<(), std::io::Error> {
     let args: Vec<String> = env::args().collect();
     let program = args[0].clone();
     let mut opts = Options::new();
@@ -66,7 +66,7 @@ fn main() {
     // Check that we have at least one input file elf to process.
     if matches.free.is_empty() {
         print_usage(&program, opts);
-        return;
+        return Ok(());
     };
 
     // Create the metadata.toml file needed for the TAB file.
@@ -78,8 +78,7 @@ name = \"{}\"
 only-for-boards = \"\"
 build-date = {}",
         package_name.clone().unwrap(),
-        chrono::prelude::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-    ).unwrap();
+        chrono::prelude::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap();
 
     // Start creating a tar archive which will be the .tab file.
     let tab_name = fs::File::create(path::Path::new(&output.unwrap()))
@@ -91,8 +90,7 @@ build-date = {}",
     header.set_size(metadata_toml.as_bytes().len() as u64);
     header.set_mode(0o644);
     header.set_cksum();
-    tab.append_data(&mut header, "metadata.toml", metadata_toml.as_bytes())
-        .unwrap();
+    tab.append_data(&mut header, "metadata.toml", metadata_toml.as_bytes())?;
 
     // Iterate all input elfs. Convert them to Tock friendly binaries and then
     // add them to the TAB file.
@@ -108,8 +106,7 @@ build-date = {}",
             .write(true)
             .create(true)
             .truncate(true)
-            .open(tbf_path.clone())
-            .unwrap();
+            .open(tbf_path.clone())?;
 
         // Do the conversion to a tock binary.
         elf_to_tbf(
@@ -120,18 +117,18 @@ build-date = {}",
             stack_len,
             app_heap_len,
             kernel_heap_len,
-        ).unwrap();
+        )?;
 
         // Add the file to the TAB tar file.
-        outfile.seek(io::SeekFrom::Start(0)).unwrap();
-        tab.append_file(tbf_path.file_name().unwrap(), &mut outfile)
-            .unwrap();
-        outfile.seek(io::SeekFrom::Start(0)).unwrap();
+        outfile.seek(io::SeekFrom::Start(0))?;
+        tab.append_file(tbf_path.file_name().unwrap(), &mut outfile)?;
+        outfile.seek(io::SeekFrom::Start(0))?;
         tab.append_file(
             tbf_path.with_extension("bin").file_name().unwrap(),
             &mut outfile,
-        ).unwrap();
+        )?;
     }
+    Ok(())
 }
 
 fn print_usage(program: &str, opts: Options) {
