@@ -10,12 +10,31 @@ use std::fs;
 use std::io;
 use std::io::{Seek, Write};
 use std::mem;
+use std::slice;
 
 #[macro_use]
 mod util;
 mod cmdline;
 mod header;
 use structopt::StructOpt;
+
+#[repr(C)]
+#[derive(Clone, Debug)]
+struct Header {
+    got_sym_start: u32,
+    got_start: u32,
+    got_size: u32,
+
+    data_sym_start: u32,
+    data_start: u32,
+    data_size: u32,
+
+    bss_start: u32,
+    bss_size: u32,
+    reldata_start: u32,
+
+    stack_size: u32,
+}
 
 fn main() {
     let opt = cmdline::Opt::from_args();
@@ -191,6 +210,28 @@ fn elf_to_tbf(
     // Need a place to put the app sections before we know the true TBF header.
     let mut binary: Vec<u8> = Vec::new();
 
+    let mut vtable_offset = 0;
+    let mut vtable_size = 0;
+    let mut first = true;
+
+    for section in &input.sections {
+        if section.shdr.name.contains("symtab") {
+            for symbol in input.get_symbols(section) {
+                for sym in symbol {
+                    if sym.name.contains("unnamed") {
+                        vtable_size += sym.size;
+                        if first {
+                            vtable_offset = sym.value;
+                            first = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("Size {}", vtable_size);
+    println!("Offset {}", vtable_offset);
+
     // Iterate the sections in the ELF file and add them to the binary as needed
     for s in sections_sort.iter() {
         let section = &input.sections[s.0];
@@ -226,8 +267,36 @@ fn elf_to_tbf(
                     section.shdr.name, binary_index
                 );
             }
-            binary.extend(&section.data);
 
+            if section.shdr.name.contains("crt0") {
+                let len = section.data.len();
+                println!("crt0 len: {}", len);
+                let mut header = unsafe {
+                    let x = &mut *(section.data.as_slice().as_ptr() as *mut Header);
+                    x.clone()
+                };
+
+                // header.got_sym_start = 3; // crashes
+                //header.got_start = 3; // writes to got_size
+                //header.got_size = 3; // writes to  data_start
+                //header.data_sym_start = 3; // writes to bss_start
+                // header.data_start = 3; // crashes
+                //header.data_size = 3; // nirvana
+                //header.bss_start = 3;
+                println!("vtable_offset {}", vtable_offset);
+                println!("data_start {}", header.data_start);
+                header.bss_start = (vtable_offset - header.data_start as u64) as u32;
+                header.bss_size = vtable_size as u32;
+                //header.reldata_start = 3;
+                //header.stack_size = 3;
+
+                let header_slice =
+                    unsafe { slice::from_raw_parts((&header as *const _) as *const u8, len) };
+                println!("Written bytes: {}", header_slice.len());
+                binary.extend(header_slice);
+            } else {
+                binary.extend(&section.data);
+            }
             // Check if this is a writeable flash region. If so, we need to
             // set the offset and size in the header.
             if section.shdr.name.contains(".wfr") && section.shdr.size > 0 {
