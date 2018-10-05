@@ -4,6 +4,8 @@ extern crate tar;
 #[macro_use]
 extern crate structopt;
 
+extern crate byteorder;
+
 use std::cmp;
 use std::fmt::Write as fmtwrite;
 use std::fs;
@@ -16,25 +18,8 @@ use std::slice;
 mod util;
 mod cmdline;
 mod header;
+mod relocs;
 use structopt::StructOpt;
-
-#[repr(C)]
-#[derive(Clone, Debug)]
-struct Header {
-    got_sym_start: u32,
-    got_start: u32,
-    got_size: u32,
-
-    data_sym_start: u32,
-    data_start: u32,
-    data_size: u32,
-
-    bss_start: u32,
-    bss_size: u32,
-    reldata_start: u32,
-
-    stack_size: u32,
-}
 
 fn main() {
     let opt = cmdline::Opt::from_args();
@@ -132,6 +117,11 @@ fn elf_to_tbf(
     }
     sections_sort.sort_by_key(|s| s.1);
 
+    let vtable_relocation = relocs::produce_relocs(
+        input.get_section(".data").unwrap(),
+        input.get_section(".rel.data").unwrap(),
+    );
+
     // Keep track of how much RAM this app will need.
     let mut minimum_ram_size: u32 = 0;
 
@@ -210,28 +200,6 @@ fn elf_to_tbf(
     // Need a place to put the app sections before we know the true TBF header.
     let mut binary: Vec<u8> = Vec::new();
 
-    let mut vtable_offset = 0;
-    let mut vtable_size = 0;
-    let mut first = true;
-
-    for section in &input.sections {
-        if section.shdr.name.contains("symtab") {
-            for symbol in input.get_symbols(section) {
-                for sym in symbol {
-                    if sym.name.contains("unnamed") {
-                        vtable_size += sym.size;
-                        if first {
-                            vtable_offset = sym.value;
-                            first = false;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    println!("Size {}", vtable_size);
-    println!("Offset {}", vtable_offset);
-
     // Iterate the sections in the ELF file and add them to the binary as needed
     for s in sections_sort.iter() {
         let section = &input.sections[s.0];
@@ -269,31 +237,6 @@ fn elf_to_tbf(
             }
 
             if section.shdr.name.contains("crt0") {
-                let len = section.data.len();
-                println!("crt0 len: {}", len);
-                let mut header = unsafe {
-                    let x = &mut *(section.data.as_slice().as_ptr() as *mut Header);
-                    x.clone()
-                };
-
-                // header.got_sym_start = 3; // crashes
-                //header.got_start = 3; // writes to got_size
-                //header.got_size = 3; // writes to  data_start
-                //header.data_sym_start = 3; // writes to bss_start
-                // header.data_start = 3; // crashes
-                //header.data_size = 3; // nirvana
-                //header.bss_start = 3;
-                println!("vtable_offset {}", vtable_offset);
-                println!("data_start {}", header.data_start);
-                header.bss_start = (vtable_offset - header.data_start as u64) as u32;
-                header.bss_size = vtable_size as u32;
-                //header.reldata_start = 3;
-                //header.stack_size = 3;
-
-                let header_slice =
-                    unsafe { slice::from_raw_parts((&header as *const _) as *const u8, len) };
-                println!("Written bytes: {}", header_slice.len());
-                binary.extend(header_slice);
             } else {
                 binary.extend(&section.data);
             }
@@ -355,7 +298,15 @@ fn elf_to_tbf(
 
     // Add the relocation data to our total length. Also include the 4 bytes for
     // the relocation data length.
+    relocation_binary.write_all(&vtable_relocation).unwrap();
+
+    println!("Vtable relocation {:x?}", vtable_relocation);
     binary_index += relocation_binary.len() + mem::size_of::<u32>();
+    let crt0_data = relocs::replace_crt0(
+        input.get_section(".crt0_header").unwrap(),
+        (binary_index - vtable_relocation.len()) as u32,
+        vtable_relocation.len() as u32,
+    );
 
     // That is everything that we are going to include in our app binary. Now
     // we need to pad the binary to a power of 2 in size, and make sure it is
@@ -378,6 +329,7 @@ fn elf_to_tbf(
 
     // Write the header and actual app to a binary file.
     output.write_all(tbfheader.generate().unwrap().get_ref())?;
+    output.write_all(&crt0_data)?;
     output.write_all(binary.as_ref())?;
 
     let rel_data_len: [u8; 4] = [
